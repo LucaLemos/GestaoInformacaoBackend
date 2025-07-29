@@ -46,6 +46,7 @@ const pool = new Pool({
   }
 });
 
+
 // Testar conexão com o banco
 pool.connect((err, client, release) => {
   if (err) {
@@ -60,6 +61,287 @@ pool.connect((err, client, release) => {
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
   next();
+});
+
+// Endpoint de registro
+app.post('/api/auth/register', async (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ 
+      success: false,
+      message: 'Username e senha são obrigatórios' 
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Verifica se o usuário já existe
+    const userCheck = await client.query(
+      'SELECT id FROM users WHERE username = $1',
+      [username.toLowerCase()]
+    );
+
+    if (userCheck.rowCount > 0) {
+      return res.status(400).json({ 
+        success: false,
+        message: 'Username já está em uso' 
+      });
+    }
+
+    // Cria o usuário
+    const userResult = await client.query(
+      'INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id, username',
+      [username, password]
+    );
+
+    await client.query('COMMIT');
+    
+    res.status(201).json({ 
+      success: true,
+      user: userResult.rows[0] 
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Registration error:', err);
+    res.status(500).json({ 
+      success: false,
+      message: 'Erro ao registrar usuário' 
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Endpoint de login
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+
+  // Validação básica
+  if (!username || !password) {
+    return res.status(400).json({ 
+      success: false,
+      message: 'Username e senha são obrigatórios' 
+    });
+  }
+
+  try {
+    // 1. Primeiro verifica se o usuário existe
+    const userQuery = await pool.query(
+      'SELECT id, username, password FROM users WHERE username = $1',
+      [username.toLowerCase()]
+    );
+
+    // Se não encontrou usuário
+    if (userQuery.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false,
+        message: 'Usuário não encontrado' 
+      });
+    }
+
+    const user = userQuery.rows[0];
+
+    // 2. Verifica a senha (considerando que está sem hash por enquanto)
+    if (password !== user.password) {
+      return res.status(401).json({ 
+        success: false,
+        message: 'Senha incorreta' 
+      });
+    }
+
+    // 3. Se chegou aqui, login é válido
+    return res.json({ 
+      success: true,
+      message: 'Login bem-sucedido',
+      user: {
+        id: user.id,
+        username: user.username
+      },
+    });
+
+  } catch (err) {
+    console.error('Login error:', err);
+    return res.status(500).json({ 
+      success: false,
+      message: 'Erro interno ao processar login' 
+    });
+  }
+});
+
+app.get('/api/plantas', async (req, res) => {
+  const { search } = req.query;
+  
+  try {
+    let query = `
+      SELECT 
+        id,
+        nome_cientifico, 
+        nome_popular,
+        detalhes,
+        data_plantio,
+        fonte,
+        usuario_id,
+        latitude,
+        longitude,
+        created_at
+      FROM plantas
+      WHERE 1=1
+    `;
+
+    const params = [];
+    
+    if (search) {
+      query += ` AND (nome_popular ILIKE $1 OR nome_cientifico ILIKE $1)`;
+      params.push(`%${search}%`);
+    }
+
+    query += ` ORDER BY nome_cientifico`;
+
+    const { rows } = await pool.query(query, params);
+    
+    // Formata a resposta para manter compatibilidade
+    const formattedRows = rows.map(row => ({
+      ...row,
+      tipo: 'planta',
+      count: 1 // Para manter a estrutura esperada pelo frontend
+    }));
+    
+    res.json(formattedRows);
+  } catch (err) {
+    console.error('Erro ao buscar plantas:', err);
+    res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
+
+app.post('/api/plants', async (req, res) => {
+  const {
+    nome_cientifico,
+    nome_popular,
+    detalhes,
+    data_plantio,
+    fonte,
+    usuario_id,
+    latitude,
+    longitude
+  } = req.body;
+
+  // Validação - pelo menos um nome deve estar preenchido
+  if (!nome_cientifico && !nome_popular) {
+    return res.status(400).json({ 
+      success: false,
+      message: 'Pelo menos o nome científico ou popular deve ser fornecido' 
+    });
+  }
+
+  // Validação - coordenadas são obrigatórias
+  if (!latitude || !longitude) {
+    return res.status(400).json({ 
+      success: false,
+      message: 'Coordenadas geográficas são obrigatórias' 
+    });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO plantas (
+        nome_cientifico, 
+        nome_popular, 
+        detalhes, 
+        data_plantio, 
+        fonte, 
+        usuario_id, 
+        latitude, 
+        longitude
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
+      RETURNING *`,
+      [
+        nome_cientifico || null,
+        nome_popular || null,
+        detalhes || null,
+        data_plantio || null,
+        fonte || null,
+        usuario_id || null,
+        latitude,
+        longitude
+      ]
+    );
+    
+    res.status(201).json({ 
+      success: true,
+      plant: rows[0],
+      message: 'Planta cadastrada com sucesso'
+    });
+  } catch (err) {
+    console.error('Database error:', {
+      message: err.message,
+      code: err.code,
+      detail: err.detail,
+      constraint: err.constraint
+    });
+    
+    let errorMessage = 'Erro ao cadastrar planta';
+
+    res.status(500).json({ 
+      success: false,
+      message: errorMessage,
+      error: err.message
+    });
+  }
+});
+
+// GET - Listar comentários de uma planta
+app.get('/api/plants/:plantId/comments', async (req, res) => {
+  const { plantId } = req.params;
+  
+  try {
+    const { rows } = await pool.query(`
+      SELECT pc.*, u.username as author
+      FROM plant_comments pc
+      JOIN users u ON pc.user_id = u.id
+      WHERE pc.plant_id = $1
+      ORDER BY pc.created_at DESC
+    `, [plantId]);
+    
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching comments:', err);
+    res.status(500).json({ error: 'Failed to fetch comments' });
+  }
+});
+
+// POST - Adicionar comentário
+app.post('/api/plants/:plantId/comments', async (req, res) => {
+  const { plantId } = req.params;
+  const { userId, text } = req.body;
+  
+  if (!userId || !text) {
+    return res.status(400).json({ error: 'userId and text are required' });
+  }
+
+  try {
+    const { rows } = await pool.query(`
+      INSERT INTO plant_comments (plant_id, user_id, comment_text)
+      VALUES ($1, $2, $3)
+      RETURNING *, (SELECT username FROM users WHERE id = $2) as author
+    `, [plantId, userId, text]);
+    
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('Error adding comment:', {
+      message: err.message,
+      stack: err.stack,
+      code: err.code,
+      detail: err.detail,
+      constraint: err.constraint
+    });
+    res.status(500).json({ 
+      error: 'Failed to add comment',
+      details: err.message 
+    });
+  }
 });
 
 // Endpoint de espécies
@@ -137,9 +419,6 @@ app.get('/api/especies', async (req, res) => {
 
     query += ` ORDER BY nome_popular`;
 
-    console.log('Executando query:', query);
-    console.log('Parâmetros:', params);
-
     const { rows } = await pool.query(query, params);
     res.json(rows);
   } catch (err) {
@@ -188,8 +467,6 @@ app.get('/api/rooms', async (req, res) => {
 // Create a new room
 app.post('/api/rooms', async (req, res) => {
   const { name, description, creator_id } = req.body;
-  
-  console.log('Starting room creation with:', { name, description, creator_id });
 
   if (!name || !creator_id) {
     return res.status(400).json({ error: 'Name and creator ID are required' });
@@ -200,20 +477,16 @@ app.post('/api/rooms', async (req, res) => {
     await client.query('BEGIN');
     
     // 1. Create room
-    console.log('Executing room creation query');
     const roomResult = await client.query(
       'INSERT INTO rooms (name, description, creator_id) VALUES ($1, $2, $3) RETURNING *',
       [name, description, creator_id]
     );
-    console.log('Room created:', roomResult.rows[0]);
     
     // 2. Add creator to members
-    console.log('Adding creator to members');
     await client.query(
       'INSERT INTO room_members (room_id, user_id) VALUES ($1, $2)',
       [roomResult.rows[0].id, creator_id]
     );
-    console.log('Creator added as member');
     
     await client.query('COMMIT');
     res.status(201).json(roomResult.rows[0]);
@@ -260,8 +533,6 @@ app.get('/api/rooms/:roomId/messages', async (req, res) => {
 app.post('/api/rooms/:roomId/messages', async (req, res) => {
   const { roomId } = req.params;
   const { sender_id, content } = req.body;
-  console.log(req.params)
-  console.log(req.body)
 
   if (!sender_id || !content) {
     return res.status(400).json({ error: 'Sender ID and content are required' });
@@ -335,15 +606,6 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
-  console.log(`Endpoints disponíveis:`);
-  console.log(`- GET /api/especies`);
-  console.log(`- GET /api/filtros`);
-  console.log(`- GET /api/health`);
-  console.log(`- GET /api/rooms`);
-  console.log(`- POST /api/rooms`);
-  console.log(`- GET /api/rooms/:roomId/messages`);
-  console.log(`- POST /api/rooms/:roomId/messages`);
-  console.log(`- POST /api/rooms/:roomId/join`);
 });
 
 // Encerramento adequado
