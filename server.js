@@ -94,7 +94,7 @@ app.post('/api/auth/register', async (req, res) => {
     // Cria o usuário
     const userResult = await client.query(
       'INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id, username',
-      [username, password]
+      [username.toLowerCase(), password]
     );
 
     await client.query('COMMIT');
@@ -117,7 +117,10 @@ app.post('/api/auth/register', async (req, res) => {
 
 // Endpoint de login
 app.post('/api/auth/login', async (req, res) => {
+  console.log('aqui')
   const { username, password } = req.body;
+  console.log(username)
+  console.log(password)
 
   // Validação básica
   if (!username || !password) {
